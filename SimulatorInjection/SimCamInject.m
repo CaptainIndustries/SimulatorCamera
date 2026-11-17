@@ -515,6 +515,122 @@ static CMSampleBufferRef SCSampleBuffer(CVPixelBufferRef pb, CMTime pts) {
     return sb;
 }
 
+#pragma mark - EAN decoder
+
+// Vision's barcode request is not available in every simulator runtime (it fails with an error there), so EAN-13
+// and EAN-8 are also decoded here from scanlines: run lengths, guards, digit tables, parity, checksum. Digit
+// patterns are module widths (space, bar, space, bar) for the left half; the right half reads with the L table
+// (bar, space, bar, space has the same widths). UPC-A is an EAN-13 with a leading 0, as AVFoundation reports it.
+static const int kEANL[10][4] = {{3,2,1,1},{2,2,2,1},{2,1,2,2},{1,4,1,1},{1,1,3,2},{1,2,3,1},{1,1,1,4},{1,3,1,2},{1,2,1,3},{3,1,1,2}};
+static const int kEANG[10][4] = {{1,1,2,3},{1,2,2,2},{2,2,1,2},{1,1,4,1},{2,3,1,1},{1,3,2,1},{4,1,1,1},{2,1,3,1},{3,1,2,1},{2,1,1,3}};
+static const char *kEANParity[10] = {"LLLLLL","LLGLGG","LLGGLG","LLGGGL","LGLLGG","LGGLLG","LGGGLL","LGLGLG","LGLGGL","LGGLGL"};
+
+// Best digit for four run widths against a table; writes the distance to it (0 is a perfect match).
+static int SCEANDigit(const float *w, const int table[10][4], float *dist) {
+    float total = w[0] + w[1] + w[2] + w[3], best = 1e9f; int digit = -1;
+    if (total <= 0) { *dist = 1e9f; return -1; }
+    for (int d = 0; d < 10; d++) {
+        float sum = 0;
+        for (int k = 0; k < 4; k++) sum += fabsf(w[k] * 7 / total - table[d][k]);
+        if (sum < best) { best = sum; digit = d; }
+    }
+    *dist = best;
+    return digit;
+}
+static BOOL SCEANGuard(const float *runs, int n, float module) {
+    for (int i = 0; i < n; i++) if (runs[i] < module * 0.4f || runs[i] > module * 1.9f) return NO;
+    return YES;
+}
+// Decodes 59 runs (EAN-13) or 43 runs (EAN-8) starting on a bar into digits; returns the digit count or 0.
+static int SCEANDecodeRuns(const float *runs, int count, char *out) {
+    int left = count == 59 ? 6 : count == 43 ? 4 : 0;
+    if (!left) return 0;
+    float total = 0; for (int i = 0; i < count; i++) total += runs[i];
+    float module = total / (count == 59 ? 95 : 67);
+    if (module < 1.0f) return 0;
+    int mid = 3 + left * 4;
+    if (!SCEANGuard(runs, 3, module) || !SCEANGuard(runs + mid, 5, module) || !SCEANGuard(runs + count - 3, 3, module)) return 0;
+    int digits[12]; char parity[7] = {0}; int n = 0; float worst = 0;
+    for (int i = 0; i < left; i++) {
+        const float *w = runs + 3 + i * 4;
+        float dl, dg; int l = SCEANDigit(w, kEANL, &dl), g = SCEANDigit(w, kEANG, &dg);
+        if (count == 43) dg = 1e9f; // EAN-8 left digits are all L-coded
+        if (dl <= dg) { digits[n++] = l; parity[i] = 'L'; worst = fmaxf(worst, dl); }
+        else { digits[n++] = g; parity[i] = 'G'; worst = fmaxf(worst, dg); }
+    }
+    for (int i = 0; i < left; i++) {
+        float d; digits[n++] = SCEANDigit(runs + mid + 5 + i * 4, kEANL, &d); worst = fmaxf(worst, d);
+    }
+    if (worst > 1.6f) return 0;
+    int all[13], len;
+    if (count == 59) {
+        int first = -1;
+        for (int d = 0; d < 10; d++) if (!strcmp(parity, kEANParity[d])) { first = d; break; }
+        if (first < 0) return 0;
+        all[0] = first; for (int i = 0; i < 12; i++) all[i + 1] = digits[i]; len = 13;
+    } else { for (int i = 0; i < 8; i++) all[i] = digits[i]; len = 8; }
+    int sum = 0; // the digit before the check digit weighs 3, then 1, 3, … leftwards
+    for (int i = 0; i < len - 1; i++) sum += all[i] * ((len - 1 - i) % 2 ? 3 : 1);
+    if ((10 - sum % 10) % 10 != all[len - 1]) return 0;
+    for (int i = 0; i < len; i++) out[i] = (char)('0' + all[i]);
+    out[len] = 0;
+    return len;
+}
+// Scans 24 rows across the frame, then 24 columns (a code held sideways), each in both directions. Returns
+// @{type, value, bounds} (bounds normalised, top-left origin) for the first code found, else an empty array.
+static NSArray<NSDictionary *> *SCDecodeEAN(CVPixelBufferRef pb, NSArray *wanted) {
+    BOOL want13 = [wanted containsObject:AVMetadataObjectTypeEAN13Code], want8 = [wanted containsObject:AVMetadataObjectTypeEAN8Code];
+    if ((!want13 && !want8) || CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA) return @[];
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb);
+    const uint8_t *base = CVPixelBufferGetBaseAddress(pb);
+    size_t longest = W > H ? W : H;
+    uint8_t *gray = malloc(longest);
+    float *runs = malloc(sizeof(float) * (longest + 1));
+    NSMutableArray *hits = [NSMutableArray array];
+    for (int pass = 0; pass < 2 && !hits.count; pass++) {
+        size_t lines = pass ? W : H, cols = pass ? H : W;
+        for (int r = 0; r < 24 && !hits.count; r++) {
+            size_t y = lines * (r + 1) / 25;
+            int lo = 255, hi = 0;
+            for (size_t x = 0; x < cols; x++) {
+                const uint8_t *px = pass ? base + x * stride + y * 4 : base + y * stride + x * 4;
+                int g = (px[0] * 29 + px[1] * 150 + px[2] * 77) >> 8; // BGRA
+                gray[x] = (uint8_t)g; if (g < lo) lo = g; if (g > hi) hi = g;
+            }
+            if (hi - lo < 48) continue;
+            int threshold = (lo + hi) / 2, n = 0; BOOL bar = NO;
+            for (size_t x = 0; x < cols; x++) {
+                BOOL dark = gray[x] < threshold;
+                if (n == 0) { if (!dark) continue; bar = YES; runs[0] = 1; n = 1; }
+                else if (dark == bar) runs[n - 1] += 1;
+                else { bar = dark; runs[n++] = 1; }
+            }
+            for (int dir = 0; dir < 2 && !hits.count; dir++) {
+                const float *seq = runs; int count = n;
+                if (dir) { // reversed: runs[n-1] first; drop a leading space so index 0 is a bar
+                    for (int i = 0; i < n / 2; i++) { float t = runs[i]; runs[i] = runs[n - 1 - i]; runs[n - 1 - i] = t; }
+                    if (n % 2 == 0) { seq = runs + 1; count = n - 1; }
+                }
+                char code[14];
+                for (int i = 0; i + 43 <= count && !hits.count; i += 2) {
+                    int len = 0;
+                    if (want13 && i + 59 <= count) len = SCEANDecodeRuns(seq + i, 59, code);
+                    if (!len && want8) len = SCEANDecodeRuns(seq + i, 43, code);
+                    if (!len) continue;
+                    CGFloat band = (CGFloat)y / lines;
+                    CGRect b = pass ? CGRectMake(band - 0.05, 0.1, 0.1, 0.8) : CGRectMake(0.1, band - 0.05, 0.8, 0.1);
+                    [hits addObject:@{ @"type": len == 13 ? AVMetadataObjectTypeEAN13Code : AVMetadataObjectTypeEAN8Code,
+                                       @"value": @(code), @"bounds": [NSValue valueWithCGRect:b] }];
+                }
+            }
+        }
+    }
+    free(gray); free(runs);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return hits;
+}
+
 static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *session, CVPixelBufferRef pb, CMTime pts) {
     NSArray *wanted = objc_getAssociatedObject(out, kSCMetaTypesKey);
     NSMutableArray<VNBarcodeSymbology> *symbologies = [NSMutableArray array];
@@ -527,40 +643,53 @@ static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *se
         if (calls % 150 == 1) SCLog(@"metadata: output has no delegate/queue yet");
         return;
     }
-    // 1D codes read best along the frame's rows: try the frame as is, then rotated, for a pot held either way.
-    NSArray<VNBarcodeObservation *> *found = nil;
+    // Each hit: type, value, bounds (normalised, top-left origin) and optionally corners (same space).
+    NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
+    // 1. Vision, the frame as is and rotated (1D codes read best along the rows). It maps results back to the
+    //    unrotated image. Vision is bottom-left; metadata objects are top-left.
+    NSError *visionError = nil;
     for (NSNumber *orientation in @[@(kCGImagePropertyOrientationUp), @(kCGImagePropertyOrientationRight)]) {
         VNDetectBarcodesRequest *req = [VNDetectBarcodesRequest new];
         req.symbologies = symbologies;
         VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb
             orientation:(CGImagePropertyOrientation)orientation.unsignedIntValue options:@{}];
-        if ([h performRequests:@[req] error:nil] && req.results.count) { found = req.results; break; }
+        NSError *err = nil;
+        if (![h performRequests:@[req] error:&err]) { visionError = err; break; }
+        for (VNBarcodeObservation *f in req.results) {
+            if (!f.payloadStringValue) continue;
+            AVMetadataObjectType type = nil;
+            for (AVMetadataObjectType t in gMetaTypes) if ([gSymbologies[t] isEqualToString:f.symbology]) { type = t; break; }
+            if (!type || ![wanted containsObject:type]) continue;
+            CGRect b = f.boundingBox;
+            NSDictionary *(^pt)(CGPoint) = ^(CGPoint p) { return (__bridge_transfer NSDictionary *)CGPointCreateDictionaryRepresentation(CGPointMake(p.x, 1 - p.y)); };
+            [hits addObject:@{ @"type": type, @"value": f.payloadStringValue,
+                               @"bounds": [NSValue valueWithCGRect:CGRectMake(b.origin.x, 1 - (b.origin.y + b.size.height), b.size.width, b.size.height)],
+                               @"corners": @[pt(f.topLeft), pt(f.topRight), pt(f.bottomRight), pt(f.bottomLeft)] }];
+        }
+        if (hits.count) break;
     }
-    if (!found.count) {
+    if (visionError && calls % 150 == 1) SCLog(@"metadata: Vision barcode request failed (%@); using the built-in EAN decoder", visionError.localizedDescription);
+    // 2. The scanline decoder for EAN-13/EAN-8 when Vision found nothing or is unavailable.
+    if (!hits.count) [hits addObjectsFromArray:SCDecodeEAN(pb, wanted)];
+    if (!hits.count) {
         if (calls % 150 == 1) SCLog(@"metadata: no barcode in the last ~30 s of frames (%zux%zu, looking for %@)",
                                     CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), [symbologies componentsJoinedByString:@" "]);
         return;
     }
     NSMutableArray *objs = [NSMutableArray array];
-    for (VNBarcodeObservation *f in found) {
-        if (!f.payloadStringValue) { SCLog(@"metadata: %@ found but no payload", f.symbology); continue; }
-        AVMetadataObjectType type = nil;
-        for (AVMetadataObjectType t in gMetaTypes) if ([gSymbologies[t] isEqualToString:f.symbology]) { type = t; break; }
-        if (!type || ![wanted containsObject:type]) continue;
-        SCLog(@"metadata: %@ %@", type, f.payloadStringValue);
+    for (NSDictionary *hit in hits) {
+        SCLog(@"metadata: %@ %@", hit[@"type"], hit[@"value"]);
         SCQRObject *o = class_createInstance([SCQRObject class], 0);
-        // Metadata coordinates are normalised, origin top-left (Vision is bottom-left). Vision already maps its
-        // results back to the unrotated image, so the orientation tried above needs no undoing here.
-        CGRect b = f.boundingBox;
-        o->_bounds = CGRectMake(b.origin.x, 1 - (b.origin.y + b.size.height), b.size.width, b.size.height);
-        NSDictionary *(^pt)(CGPoint) = ^(CGPoint p) { return (__bridge_transfer NSDictionary *)CGPointCreateDictionaryRepresentation(CGPointMake(p.x, 1 - p.y)); };
-        o->_corners = @[pt(f.topLeft), pt(f.topRight), pt(f.bottomRight), pt(f.bottomLeft)];
-        o->_value = f.payloadStringValue;
-        o->_type = type;
+        CGRect b = [hit[@"bounds"] CGRectValue];
+        NSDictionary *(^pt)(CGFloat, CGFloat) = ^(CGFloat x, CGFloat y) { return (__bridge_transfer NSDictionary *)CGPointCreateDictionaryRepresentation(CGPointMake(x, y)); };
+        o->_bounds = b;
+        o->_corners = hit[@"corners"] ?: @[pt(CGRectGetMinX(b), CGRectGetMinY(b)), pt(CGRectGetMaxX(b), CGRectGetMinY(b)),
+                                           pt(CGRectGetMaxX(b), CGRectGetMaxY(b)), pt(CGRectGetMinX(b), CGRectGetMaxY(b))];
+        o->_value = hit[@"value"];
+        o->_type = hit[@"type"];
         o->_time = pts;
         [objs addObject:o];
     }
-    if (!objs.count) return;
     AVCaptureConnection *c = SCConnectionFor(out);
     dispatch_async(q, ^{ [d captureOutput:out didOutputMetadataObjects:objs fromConnection:c]; });
 }
