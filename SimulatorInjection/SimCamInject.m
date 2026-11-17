@@ -22,6 +22,7 @@
 #undef I // complex.h (via Vision) defines I; SCInstall names a Class I
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <os/log.h>
 #import <objc/message.h>
 #import <sys/mman.h>
 #import <fcntl.h>
@@ -43,7 +44,9 @@ static void SCLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[SimulatorCamera] %@", s);
+    // Error level on purpose: dev tools that stream the simulator log (Expo, for one) show only errors by default,
+    // and these few lines are the only way to see from the app's side that the camera is in and what it decodes.
+    os_log_error(OS_LOG_DEFAULT, "[SimulatorCamera] %{public}@", s);
 }
 
 #pragma mark - Swizzling helpers
