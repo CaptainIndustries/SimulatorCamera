@@ -576,8 +576,10 @@ static int SCEANDecodeRuns(const float *runs, int count, char *out) {
     out[len] = 0;
     return len;
 }
-// Scans 24 rows across the frame, then 24 columns (a code held sideways), each in both directions. Returns
-// @{type, value, bounds} (bounds normalised, top-left origin) for the first code found, else an empty array.
+// Scans 40 rows across the frame, then 40 columns (a code held sideways), each in both directions, with a local
+// threshold (mean of a window about 1/40 of the line) so uneven light and the pot's own colours do not drown the
+// bars, then once more with a plain row-wide threshold. Returns @{type, value, bounds} (bounds normalised, top-left
+// origin) for the first code found, else an empty array.
 static NSArray<NSDictionary *> *SCDecodeEAN(CVPixelBufferRef pb, NSArray *wanted) {
     BOOL want13 = [wanted containsObject:AVMetadataObjectTypeEAN13Code], want8 = [wanted containsObject:AVMetadataObjectTypeEAN8Code];
     if ((!want13 && !want8) || CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA) return @[];
@@ -586,22 +588,33 @@ static NSArray<NSDictionary *> *SCDecodeEAN(CVPixelBufferRef pb, NSArray *wanted
     const uint8_t *base = CVPixelBufferGetBaseAddress(pb);
     size_t longest = W > H ? W : H;
     uint8_t *gray = malloc(longest);
+    int *prefix = malloc(sizeof(int) * (longest + 1));
     float *runs = malloc(sizeof(float) * (longest + 1));
     NSMutableArray *hits = [NSMutableArray array];
-    for (int pass = 0; pass < 2 && !hits.count; pass++) {
-        size_t lines = pass ? W : H, cols = pass ? H : W;
-        for (int r = 0; r < 24 && !hits.count; r++) {
-            size_t y = lines * (r + 1) / 25;
+    for (int pass = 0; pass < 4 && !hits.count; pass++) {
+        BOOL columns = pass % 2, local = pass < 2;
+        size_t lines = columns ? W : H, cols = columns ? H : W;
+        int radius = (int)cols / 40; if (radius < 10) radius = 10;
+        for (int r = 0; r < 40 && !hits.count; r++) {
+            size_t y = lines * (r + 1) / 41;
             int lo = 255, hi = 0;
+            prefix[0] = 0;
             for (size_t x = 0; x < cols; x++) {
-                const uint8_t *px = pass ? base + x * stride + y * 4 : base + y * stride + x * 4;
+                const uint8_t *px = columns ? base + x * stride + y * 4 : base + y * stride + x * 4;
                 int g = (px[0] * 29 + px[1] * 150 + px[2] * 77) >> 8; // BGRA
                 gray[x] = (uint8_t)g; if (g < lo) lo = g; if (g > hi) hi = g;
+                prefix[x + 1] = prefix[x] + g;
             }
             if (hi - lo < 48) continue;
             int threshold = (lo + hi) / 2, n = 0; BOOL bar = NO;
             for (size_t x = 0; x < cols; x++) {
-                BOOL dark = gray[x] < threshold;
+                BOOL dark;
+                if (local) {
+                    int a = (int)x - radius, b = (int)x + radius + 1;
+                    if (a < 0) a = 0; if (b > (int)cols) b = (int)cols;
+                    int mean = (prefix[b] - prefix[a]) / (b - a);
+                    dark = gray[x] < mean - 6;
+                } else dark = gray[x] < threshold;
                 if (n == 0) { if (!dark) continue; bar = YES; runs[0] = 1; n = 1; }
                 else if (dark == bar) runs[n - 1] += 1;
                 else { bar = dark; runs[n++] = 1; }
@@ -619,14 +632,14 @@ static NSArray<NSDictionary *> *SCDecodeEAN(CVPixelBufferRef pb, NSArray *wanted
                     if (!len && want8) len = SCEANDecodeRuns(seq + i, 43, code);
                     if (!len) continue;
                     CGFloat band = (CGFloat)y / lines;
-                    CGRect b = pass ? CGRectMake(band - 0.05, 0.1, 0.1, 0.8) : CGRectMake(0.1, band - 0.05, 0.8, 0.1);
+                    CGRect b = columns ? CGRectMake(band - 0.05, 0.1, 0.1, 0.8) : CGRectMake(0.1, band - 0.05, 0.8, 0.1);
                     [hits addObject:@{ @"type": len == 13 ? AVMetadataObjectTypeEAN13Code : AVMetadataObjectTypeEAN8Code,
                                        @"value": @(code), @"bounds": [NSValue valueWithCGRect:b] }];
                 }
             }
         }
     }
-    free(gray); free(runs);
+    free(gray); free(prefix); free(runs);
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     return hits;
 }
@@ -647,8 +660,9 @@ static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *se
     NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
     // 1. Vision, the frame as is and rotated (1D codes read best along the rows). It maps results back to the
     //    unrotated image. Vision is bottom-left; metadata objects are top-left.
+    static BOOL visionUnavailable;
     NSError *visionError = nil;
-    for (NSNumber *orientation in @[@(kCGImagePropertyOrientationUp), @(kCGImagePropertyOrientationRight)]) {
+    for (NSNumber *orientation in visionUnavailable ? @[] : @[@(kCGImagePropertyOrientationUp), @(kCGImagePropertyOrientationRight)]) {
         VNDetectBarcodesRequest *req = [VNDetectBarcodesRequest new];
         req.symbologies = symbologies;
         VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb
@@ -668,7 +682,7 @@ static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *se
         }
         if (hits.count) break;
     }
-    if (visionError && calls % 150 == 1) SCLog(@"metadata: Vision barcode request failed (%@); using the built-in EAN decoder", visionError.localizedDescription);
+    if (visionError) { visionUnavailable = YES; SCLog(@"metadata: Vision barcode request failed (%@); using the built-in EAN decoder from now on", visionError.localizedDescription); }
     // 2. The scanline decoder for EAN-13/EAN-8 when Vision found nothing or is unavailable.
     if (!hits.count) [hits addObjectsFromArray:SCDecodeEAN(pb, wanted)];
     if (!hits.count) {
