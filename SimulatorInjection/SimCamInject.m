@@ -19,6 +19,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <Vision/Vision.h>
+#undef I // complex.h (via Vision) defines I; SCInstall names a Class I
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
