@@ -107,14 +107,14 @@ into your app **in the Simulator only**. Your app still imports nothing.
    From the command line: `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES=<that path> xcrun simctl launch booted <bundle id>`.
 3. Run on a Simulator. `AVCaptureDevice.default(for: .video)` returns
    "SimulatorCamera"; frames reach `AVCaptureVideoDataOutput`,
-   `AVCaptureVideoPreviewLayer`, QR codes reach `AVCaptureMetadataOutput`, and
+   `AVCaptureVideoPreviewLayer`, barcodes (QR, EAN-13/8, UPC-E, Code 128/39/93,
+   ITF-14, PDF417, Aztec, Data Matrix; detected with Vision) reach `AVCaptureMetadataOutput`, and
    `AVCapturePhotoOutput` returns JPEGs. Without the Mac app running you see a
    built-in test pattern.
 
 Frames travel through `/private/tmp/SimulatorCamera/frame.bin`
 (`SimulatorInjection/SCFrameStore.h`). Video frames are BGRA; apps that force a
-420 YpCbCr format get BGRA anyway. Not supported yet: barcode types other than
-QR, depth, multi-cam.
+420 YpCbCr format get BGRA anyway. Not supported yet: depth, multi-cam.
 
 ### Movie recording with sound
 

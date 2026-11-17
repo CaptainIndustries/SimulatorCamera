@@ -18,6 +18,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <Vision/Vision.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -213,18 +214,19 @@ static SCConnection *SCNewConnection(void) {
 
 @implementation SCQRObject {
     @public NSString *_value;
+    @public AVMetadataObjectType _type;
     @public CGRect _bounds;
     @public NSArray *_corners;
     @public CMTime _time;
 }
-- (AVMetadataObjectType)type { return AVMetadataObjectTypeQRCode; }
+- (AVMetadataObjectType)type { return _type ?: AVMetadataObjectTypeQRCode; }
 - (NSString *)stringValue { return _value; }
 - (CGRect)bounds { return _bounds; }
 - (NSArray *)corners { return _corners; }
 - (CMTime)time { return _time; }
 - (CMTime)duration { return kCMTimeInvalid; }
 - (CIBarcodeDescriptor *)descriptor { return nil; }
-- (NSString *)description { return [NSString stringWithFormat:@"<SCQRObject %@>", _value]; }
+- (NSString *)description { return [NSString stringWithFormat:@"<SCQRObject %@ %@>", self.type, _value]; }
 @end
 
 @implementation SCPhoto {
@@ -450,7 +452,10 @@ static const void *kSCRectKey = &kSCRectKey;
 static NSHashTable *gRunning;       // running fake sessions (weak)
 static NSHashTable *gLayers;        // preview layers (weak)
 static dispatch_source_t gTimer;
-static CIDetector *gQR;
+// Barcode symbologies delivered to AVCaptureMetadataOutput, detected with Vision (CIDetector knows only QR).
+// AVFoundation reports UPC-A as EAN-13 with a leading zero, and so does Vision, so there is no UPC-A entry.
+static NSDictionary<AVMetadataObjectType, VNBarcodeSymbology> *gSymbologies;
+static NSArray<AVMetadataObjectType> *gMetaTypes;
 static NSLock *gLock;
 
 static SCSessionState *SCState(AVCaptureSession *s) {
@@ -508,24 +513,37 @@ static CMSampleBufferRef SCSampleBuffer(CVPixelBufferRef pb, CMTime pts) {
 
 static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *session, CVPixelBufferRef pb, CMTime pts) {
     NSArray *wanted = objc_getAssociatedObject(out, kSCMetaTypesKey);
-    if (![wanted containsObject:AVMetadataObjectTypeQRCode]) return;
+    NSMutableArray<VNBarcodeSymbology> *symbologies = [NSMutableArray array];
+    for (AVMetadataObjectType t in wanted) if (gSymbologies[t]) [symbologies addObject:gSymbologies[t]];
+    if (!symbologies.count) return;
     id<AVCaptureMetadataOutputObjectsDelegate> d = out.metadataObjectsDelegate;
     dispatch_queue_t q = out.metadataObjectsCallbackQueue;
     if (!d || !q || ![d respondsToSelector:@selector(captureOutput:didOutputMetadataObjects:fromConnection:)]) return;
-    CIImage *img = [CIImage imageWithCVPixelBuffer:pb];
-    NSArray<CIFeature *> *found = [gQR featuresInImage:img];
+    // 1D codes read best along the frame's rows: try the frame as is, then rotated, for a pot held either way.
+    NSArray<VNBarcodeObservation *> *found = nil;
+    for (NSNumber *orientation in @[@(kCGImagePropertyOrientationUp), @(kCGImagePropertyOrientationRight)]) {
+        VNDetectBarcodesRequest *req = [VNDetectBarcodesRequest new];
+        req.symbologies = symbologies;
+        VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb
+            orientation:(CGImagePropertyOrientation)orientation.unsignedIntValue options:@{}];
+        if ([h performRequests:@[req] error:nil] && req.results.count) { found = req.results; break; }
+    }
     if (!found.count) return;
-    CGFloat W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
     NSMutableArray *objs = [NSMutableArray array];
-    for (CIQRCodeFeature *f in found) {
-        if (![f isKindOfClass:[CIQRCodeFeature class]] || !f.messageString) continue;
+    for (VNBarcodeObservation *f in found) {
+        if (!f.payloadStringValue) continue;
+        AVMetadataObjectType type = nil;
+        for (AVMetadataObjectType t in gMetaTypes) if ([gSymbologies[t] isEqualToString:f.symbology]) { type = t; break; }
+        if (!type || ![wanted containsObject:type]) continue;
         SCQRObject *o = class_createInstance([SCQRObject class], 0);
-        // Metadata coordinates are normalised, origin top-left (CI is bottom-left).
-        CGRect b = f.bounds;
-        o->_bounds = CGRectMake(b.origin.x / W, 1 - (b.origin.y + b.size.height) / H, b.size.width / W, b.size.height / H);
-        NSDictionary *(^pt)(CGPoint) = ^(CGPoint p) { return (__bridge_transfer NSDictionary *)CGPointCreateDictionaryRepresentation(CGPointMake(p.x / W, 1 - p.y / H)); };
+        // Metadata coordinates are normalised, origin top-left (Vision is bottom-left). Vision already maps its
+        // results back to the unrotated image, so the orientation tried above needs no undoing here.
+        CGRect b = f.boundingBox;
+        o->_bounds = CGRectMake(b.origin.x, 1 - (b.origin.y + b.size.height), b.size.width, b.size.height);
+        NSDictionary *(^pt)(CGPoint) = ^(CGPoint p) { return (__bridge_transfer NSDictionary *)CGPointCreateDictionaryRepresentation(CGPointMake(p.x, 1 - p.y)); };
         o->_corners = @[pt(f.topLeft), pt(f.topRight), pt(f.bottomRight), pt(f.bottomLeft)];
-        o->_value = f.messageString;
+        o->_value = f.payloadStringValue;
+        o->_type = type;
         o->_time = pts;
         [objs addObject:o];
     }
@@ -859,7 +877,7 @@ static NSArray *sc_metaTypes(AVCaptureMetadataOutput *self, SEL _cmd) {
     return ((id (*)(id, SEL))o_metaTypes)(self, _cmd);
 }
 static NSArray *sc_availableMetaTypes(AVCaptureMetadataOutput *self, SEL _cmd) {
-    if (SCOutputIsFake(self)) return @[AVMetadataObjectTypeQRCode];
+    if (SCOutputIsFake(self)) return gMetaTypes;
     return ((id (*)(id, SEL))o_availableMetaTypes)(self, _cmd);
 }
 static void sc_setRectOfInterest(AVCaptureMetadataOutput *self, SEL _cmd, CGRect r) {
@@ -918,7 +936,7 @@ static AVMetadataObject *sc_transformMeta(AVCaptureVideoPreviewLayer *self, SEL 
     SCQRObject *q = (SCQRObject *)o;
     SCQRObject *t = class_createInstance([SCQRObject class], 0);
     CGRect b = self.bounds;
-    t->_value = q->_value; t->_time = q->_time;
+    t->_value = q->_value; t->_type = q->_type; t->_time = q->_time;
     t->_bounds = CGRectMake(b.origin.x + q->_bounds.origin.x * b.size.width, b.origin.y + q->_bounds.origin.y * b.size.height,
                             q->_bounds.size.width * b.size.width, q->_bounds.size.height * b.size.height);
     NSMutableArray *cs = [NSMutableArray array];
@@ -1019,7 +1037,20 @@ __attribute__((constructor)) static void SCInstall(void) {
     gRunning = [NSHashTable weakObjectsHashTable];
     gLayers = [NSHashTable weakObjectsHashTable];
     gFrameQueue = dispatch_queue_create("com.dautov.SimulatorCamera.frames", DISPATCH_QUEUE_SERIAL);
-    gQR = [CIDetector detectorOfType:CIDetectorTypeQRCode context:nil options:@{ CIDetectorAccuracy: CIDetectorAccuracyHigh }];
+    gSymbologies = @{
+        AVMetadataObjectTypeQRCode: VNBarcodeSymbologyQR,
+        AVMetadataObjectTypeEAN13Code: VNBarcodeSymbologyEAN13,
+        AVMetadataObjectTypeEAN8Code: VNBarcodeSymbologyEAN8,
+        AVMetadataObjectTypeUPCECode: VNBarcodeSymbologyUPCE,
+        AVMetadataObjectTypeCode128Code: VNBarcodeSymbologyCode128,
+        AVMetadataObjectTypeCode39Code: VNBarcodeSymbologyCode39,
+        AVMetadataObjectTypeCode93Code: VNBarcodeSymbologyCode93,
+        AVMetadataObjectTypeITF14Code: VNBarcodeSymbologyITF14,
+        AVMetadataObjectTypePDF417Code: VNBarcodeSymbologyPDF417,
+        AVMetadataObjectTypeAztecCode: VNBarcodeSymbologyAztec,
+        AVMetadataObjectTypeDataMatrixCode: VNBarcodeSymbologyDataMatrix,
+    };
+    gMetaTypes = gSymbologies.allKeys;
     SCInstallFakeDealloc();
 
     Class D = [AVCaptureDevice class];

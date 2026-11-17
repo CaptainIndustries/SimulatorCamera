@@ -14,7 +14,7 @@ xcrun clang -dynamiclib -fobjc-arc -fmodules -O2 -Wall -Wno-unused-variable \
   "${TEST_FLAGS[@]}" \
   -isysroot "$SDK" -arch arm64 -arch x86_64 -mios-simulator-version-min=16.0 \
   -framework Foundation -framework AVFoundation -framework CoreImage -framework CoreMedia \
-  -framework CoreVideo -framework UIKit -framework QuartzCore \
+  -framework CoreVideo -framework UIKit -framework QuartzCore -framework Vision \
   -install_name @rpath/libSimCamInject.dylib \
   -o "$OUT/libSimCamInject.dylib" "$HERE/SimCamInject.m" "$HERE/SCMovieRecorder.m"
 codesign -s - --force "$OUT/libSimCamInject.dylib" >/dev/null
