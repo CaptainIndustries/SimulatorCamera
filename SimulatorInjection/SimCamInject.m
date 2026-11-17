@@ -516,10 +516,14 @@ static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *se
     NSArray *wanted = objc_getAssociatedObject(out, kSCMetaTypesKey);
     NSMutableArray<VNBarcodeSymbology> *symbologies = [NSMutableArray array];
     for (AVMetadataObjectType t in wanted) if (gSymbologies[t]) [symbologies addObject:gSymbologies[t]];
-    if (!symbologies.count) return;
+    static NSUInteger calls; calls++;
+    if (!symbologies.count) { if (calls % 150 == 1) SCLog(@"metadata: none of the wanted types %@ is a barcode", wanted); return; }
     id<AVCaptureMetadataOutputObjectsDelegate> d = out.metadataObjectsDelegate;
     dispatch_queue_t q = out.metadataObjectsCallbackQueue;
-    if (!d || !q || ![d respondsToSelector:@selector(captureOutput:didOutputMetadataObjects:fromConnection:)]) return;
+    if (!d || !q || ![d respondsToSelector:@selector(captureOutput:didOutputMetadataObjects:fromConnection:)]) {
+        if (calls % 150 == 1) SCLog(@"metadata: output has no delegate/queue yet");
+        return;
+    }
     // 1D codes read best along the frame's rows: try the frame as is, then rotated, for a pot held either way.
     NSArray<VNBarcodeObservation *> *found = nil;
     for (NSNumber *orientation in @[@(kCGImagePropertyOrientationUp), @(kCGImagePropertyOrientationRight)]) {
@@ -529,13 +533,18 @@ static void SCDeliverMetadata(AVCaptureMetadataOutput *out, AVCaptureSession *se
             orientation:(CGImagePropertyOrientation)orientation.unsignedIntValue options:@{}];
         if ([h performRequests:@[req] error:nil] && req.results.count) { found = req.results; break; }
     }
-    if (!found.count) return;
+    if (!found.count) {
+        if (calls % 150 == 1) SCLog(@"metadata: no barcode in the last ~30 s of frames (%zux%zu, looking for %@)",
+                                    CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), [symbologies componentsJoinedByString:@" "]);
+        return;
+    }
     NSMutableArray *objs = [NSMutableArray array];
     for (VNBarcodeObservation *f in found) {
-        if (!f.payloadStringValue) continue;
+        if (!f.payloadStringValue) { SCLog(@"metadata: %@ found but no payload", f.symbology); continue; }
         AVMetadataObjectType type = nil;
         for (AVMetadataObjectType t in gMetaTypes) if ([gSymbologies[t] isEqualToString:f.symbology]) { type = t; break; }
         if (!type || ![wanted containsObject:type]) continue;
+        SCLog(@"metadata: %@ %@", type, f.payloadStringValue);
         SCQRObject *o = class_createInstance([SCQRObject class], 0);
         // Metadata coordinates are normalised, origin top-left (Vision is bottom-left). Vision already maps its
         // results back to the unrotated image, so the orientation tried above needs no undoing here.
@@ -877,6 +886,21 @@ static NSArray *sc_metaTypes(AVCaptureMetadataOutput *self, SEL _cmd) {
     if (SCOutputIsFake(self)) return objc_getAssociatedObject(self, kSCMetaTypesKey) ?: @[];
     return ((id (*)(id, SEL))o_metaTypes)(self, _cmd);
 }
+static IMP o_rotationPreview, o_rotationCapture;
+static BOOL SCCoordinatorIsFake(id self) {
+    id device = [self respondsToSelector:@selector(device)] ? ((id (*)(id, SEL))objc_msgSend)(self, @selector(device)) : nil;
+    return [device isKindOfClass:[SCDevice class]];
+}
+// AVCaptureDevice.RotationCoordinator (iOS 17): apps feed its angle straight into videoRotationAngle. For the fake
+// device it answers 0, which SCVideoDisplayTransform turns into a sideways preview; a portrait iPhone says 90.
+static CGFloat sc_rotationPreview(id self, SEL _cmd) {
+    if (SCCoordinatorIsFake(self)) return 90;
+    return ((CGFloat (*)(id, SEL))o_rotationPreview)(self, _cmd);
+}
+static CGFloat sc_rotationCapture(id self, SEL _cmd) {
+    if (SCCoordinatorIsFake(self)) return 90;
+    return ((CGFloat (*)(id, SEL))o_rotationCapture)(self, _cmd);
+}
 static NSArray *sc_availableMetaTypes(AVCaptureMetadataOutput *self, SEL _cmd) {
     if (SCOutputIsFake(self)) return gMetaTypes;
     return ((id (*)(id, SEL))o_availableMetaTypes)(self, _cmd);
@@ -1090,6 +1114,11 @@ __attribute__((constructor)) static void SCInstall(void) {
     SCSwizzleInstance(M, @selector(availableMetadataObjectTypes), (IMP)sc_availableMetaTypes, &o_availableMetaTypes);
     SCSwizzleInstance(M, @selector(setRectOfInterest:), (IMP)sc_setRectOfInterest, &o_setRectOfInterest);
     SCSwizzleInstance(M, @selector(rectOfInterest), (IMP)sc_rectOfInterest, &o_rectOfInterest);
+    Class RC = NSClassFromString(@"AVCaptureDeviceRotationCoordinator");
+    if (RC) {
+        SCSwizzleInstance(RC, @selector(videoRotationAngleForHorizonLevelPreview), (IMP)sc_rotationPreview, &o_rotationPreview);
+        SCSwizzleInstance(RC, @selector(videoRotationAngleForHorizonLevelCapture), (IMP)sc_rotationCapture, &o_rotationCapture);
+    }
     SCSwizzleInstance([AVCapturePhotoOutput class], @selector(capturePhotoWithSettings:delegate:), (IMP)sc_capturePhoto, &o_capturePhoto);
     Class F = [AVCaptureMovieFileOutput class];
     SCSwizzleInstance(F, @selector(startRecordingToOutputFileURL:recordingDelegate:), (IMP)sc_movieStart, &o_movieStart);
